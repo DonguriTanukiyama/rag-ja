@@ -1,0 +1,14 @@
+# 索引（文書から作り直せる。中身は元文書そのもの）
+_index/
+
+# 実行環境
+__pycache__/
+*.pyc
+.venv/
+
+# Windows / Google Drive が置くもの
+desktop.ini
+Thumbs.db
+
+# 実測に使った質問セット（対象が私物の文書なので公開しない）
+eval.private.json
