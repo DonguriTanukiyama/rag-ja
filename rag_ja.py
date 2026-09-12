@@ -113,6 +113,52 @@ def iter_docs(root):
                 yield os.path.join(dirpath, fn)
 
 
+# --- front-matter とフィルタ -------------------------------------------------
+#
+# ベクトル検索だけでは「2026年9月3日の」のような条件で絞れない。
+# **意味の近さではなく完全一致で絞るべきもの**がある（日付・設備・担当・部署）。
+# genba_norm.py が各文書の先頭に置いてくるので、それを metadata に入れて where で使う。
+
+FM_RE = re.compile(r"^---\s*\n(.*?)\n---\s*\n", re.S)
+
+
+def parse_front_matter(text):
+    u"""先頭の `--- ... ---` を metadata として取り出し、本文だけを返す。
+
+    front-matter が無ければ ({}, text) をそのまま返す（既存の文書は今までどおり）。
+    **索引に入るのは本文だけ。**`---` の塊が断片に混ざると検索の邪魔になる。
+    """
+    t = text.replace("\r\n", "\n")
+    m = FM_RE.match(t)
+    if not m:
+        return {}, text
+    meta = {}
+    for line in m.group(1).split("\n"):
+        if ":" in line:
+            k, v = line.split(":", 1)
+            k, v = k.strip(), v.strip()
+            if k and v:
+                meta[k] = v
+    return meta, t[m.end():]
+
+
+def build_where(pairs):
+    u"""['date=2026-09-03', 'dept=第1製造部'] → Chroma の where 条件。
+
+    条件が2つ以上なら $and でくくる（Chroma はトップレベルの複数キーを受けない）。
+    条件が無ければ None を返す。**フィルタ無しと空フィルタは別物。**
+    """
+    conds = []
+    for p in pairs or []:
+        if "=" not in p:
+            raise ValueError(u"--where は key=value の形で渡す: %s" % p)
+        k, v = p.split("=", 1)
+        conds.append({k.strip(): {"$eq": v.strip()}})
+    if not conds:
+        return None
+    return conds[0] if len(conds) == 1 else {"$and": conds}
+
+
 # --- 索引 -------------------------------------------------------------------
 
 def get_collection(reset=False):
@@ -143,6 +189,7 @@ def cmd_index(root, reset=True):
             say(u"  読めない: %s (%s)" % (path, type(e).__name__))
             continue
         rel = os.path.relpath(path, root).replace("\\", "/")
+        fm, text = parse_front_matter(text)     # 先頭の --- ブロックは索引に入れない
         pieces = split(text)
         if not pieces:
             continue
@@ -150,8 +197,10 @@ def cmd_index(root, reset=True):
         for k, (chunk, pos) in enumerate(pieces):
             ids.append("%s#%d" % (rel, k))
             docs.append(chunk)
-            metas.append({"file": rel, "chunk": k, "pos": pos,
-                          "line": text[:pos].count("\n") + 1})
+            md = {"file": rel, "chunk": k, "pos": pos,
+                  "line": text[:pos].count("\n") + 1}
+            md.update(fm)                       # date / equipment / person / dept など
+            metas.append(md)
 
     if not docs:
         say(u"索引に入れるものが無い（.md .txt .rst を探した）")
@@ -186,10 +235,12 @@ def index_is_empty():
     return get_collection().count() == 0
 
 
-def search(question, k=5):
+def search(question, k=5, where=None):
     backend, model = _saved_backend()
     col = get_collection()
     kw = {"n_results": k}
+    if where:
+        kw["where"] = where
     vecs = embed([question], backend, model)
     if vecs is not None:
         kw["query_embeddings"] = vecs
@@ -230,13 +281,15 @@ PROMPT = u"""あなたは社内資料の検索窓口です。以下の【資料�
 GEN_MODEL = "qwen2.5:7b"   # 埋め込み(1.2GB)と同居させる。12B は VRAM 10GB で溢れて遅い
 
 
-def cmd_ask(question, k=5, model=GEN_MODEL):
+def cmd_ask(question, k=5, model=GEN_MODEL, where=None):
     import requests
     if index_is_empty():
         say(u"索引が空。先に `python rag_ja.py index <ディレクトリ>` を実行する")
         return 1
-    hits, backend, emodel = search(question, k)
-    say(u"埋め込み: %s / %s   検索: 上位%d件" % (backend, emodel, len(hits)))
+    hits, backend, emodel = search(question, k, where)
+    say(u"埋め込み: %s / %s   検索: 上位%d件%s"
+        % (backend, emodel, len(hits),
+           (u"   絞り込み: %s" % where) if where else u""))
     if not hits:
         say(u"該当なし")
         return 1
@@ -329,6 +382,27 @@ def demo():
     # 4) 重なりがある（前の片の末尾が次の片に入る）
     assert ps[1][1] < ps[0][1] + len(ps[0][0])
 
+    # 5) front-matter は metadata になり、本文からは外れる
+    fm_doc = (u"---" + NL + u"doc_type: inspection" + NL + u"date: 2026-09-03" + NL +
+              u"equipment: 加圧浮上槽,活性汚泥槽" + NL + u"---" + NL + NL + u"# 本文" + NL)
+    meta, body = parse_front_matter(fm_doc)
+    assert meta["date"] == u"2026-09-03" and meta["doc_type"] == u"inspection"
+    assert meta["equipment"] == u"加圧浮上槽,活性汚泥槽"
+    assert body.startswith(u"# 本文"), repr(body[:20])   # --- の塊は索引に入れない
+    assert parse_front_matter(u"front-matter 無しの文書")[0] == {}
+    assert parse_front_matter(u"front-matter 無しの文書")[1] == u"front-matter 無しの文書"
+
+    # 6) where 条件。**フィルタ無しと空フィルタは別物**
+    assert build_where(None) is None and build_where([]) is None
+    assert build_where(["date=2026-09-03"]) == {"date": {"$eq": "2026-09-03"}}
+    assert build_where(["date=2026-09-03", "dept=第1製造部"]) == {
+        "$and": [{"date": {"$eq": "2026-09-03"}}, {"dept": {"$eq": "第1製造部"}}]}
+    try:
+        build_where(["dateだけ"])
+        raise AssertionError(u"= が無いのに通ってしまった")
+    except ValueError:
+        pass
+
     b, m = pick_embedder()
     say(u"demo OK  通常 %d片 / 句点なし %d片 / 埋め込み %s:%s" % (len(ps), len(rs), b, m))
 
@@ -351,6 +425,8 @@ def main():
     ap.add_argument("--model", default=GEN_MODEL)
     ap.add_argument("--demo", action="store_true")
     ap.add_argument("--add", action="store_true", help=u"索引を作り直さず追加する")
+    ap.add_argument("--where", action="append", metavar="KEY=VALUE",
+                    help=u"metadata で絞り込む（例 --where date=2026-09-03）。複数可")
     a = ap.parse_args()
 
     if a.demo:
@@ -364,7 +440,7 @@ def main():
         if a.cmd == "index":
             return cmd_index(a.arg, reset=not a.add)
         if a.cmd == "ask":
-            return cmd_ask(a.arg, a.k, a.model)
+            return cmd_ask(a.arg, a.k, a.model, build_where(a.where))
         if a.cmd == "eval":
             return cmd_eval(a.arg, a.k)
     except requests.exceptions.RequestException as e:

@@ -12,3 +12,14 @@ Thumbs.db
 
 # 実測に使った質問セット（対象が私物の文書なので公開しない）
 eval.private.json
+
+# サンプルと正規化の出力（make_samples.py と genba_norm.py で作り直せる）
+samples/raw/
+samples/_norm/
+samples/_norm_single/
+samples/_naive/
+
+# 内部文書（仕事探しの文脈と市場の数字が入っているので公開しない）
+HANDOVER.md
+REVIEW_REQUEST.md
+REVIEW_TRIAGE.md
