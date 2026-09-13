@@ -1,0 +1,3 @@
+# VBA のソースは、VBA エディタが Shift-JIS でしか読めない。
+# リポジトリには UTF-8 で入れ（GitHub で読める）、手元には Shift-JIS・CRLF で取り出す。
+*.bas working-tree-encoding=CP932 eol=crlf
